@@ -25,7 +25,7 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
   terminate/2, code_change/3]).
   
--record(amqp, {amqp_connection, amqp_channel, amqp_consumer_tag}).
+-record(amqp, {amqp_connection=undefined, amqp_channel=undefined, amqp_consumer_tag}).
 -record(state, {amqp=#amqp{}, message_processor=undefined, messages_since_last_metrics_call=0, messages_confirmed_since_last_metrics_call=0}).
 
 -define(AMQP_QUEUE_NAME, <<"deviceter_logservice">>).
@@ -87,15 +87,25 @@ stop() ->
 %%%===================================================================
 %%% Internal Functions
 %%%===================================================================
-init_amqp_connection(AMQPHost, AMQPExchange, AMQPExchangeType, AMQPQueue) ->
+init_amqp_connection(AMQPHost) ->
+  case amqp_connection:start(#amqp_params_network{host=AMQPHost}) of
+    {ok, AMQPConnection} ->
+      %%RabbitMQ Channel Declaration:
+      {ok, AMQPChannel} = amqp_connection:open_channel(AMQPConnection),
+      AMQP = #amqp{amqp_connection=AMQPConnection, amqp_channel=AMQPChannel},
+      {ok, AMQP};
+    {error, Error} ->
+      {error, Error}
+    end.
+
+init_and_subscribe(AMQPHost, AMQPExchange, AMQPExchangeType, AMQPQueue) ->
   case amqp_connection:start(#amqp_params_network{host=AMQPHost}) of
     {ok, AMQPConnection} ->
       %%RabbitMQ Channel Declaration:
       {ok, AMQPChannel} = amqp_connection:open_channel(AMQPConnection),
       
       %%Declare RabbitMQ Log Exchange:
-      AMQPExchangeDeclaration = #'exchange.declare'{exchange = AMQPExchange, type=AMQPExchangeType},
-      #'exchange.declare_ok'{} = amqp_channel:call(AMQPChannel, AMQPExchangeDeclaration),
+      declare_exchange(AMQPChannel, AMQPExchange, AMQPExchangeType),
       
       %%Declare RabbitMQ Queue:
       AMQPQueueDeclaration = #'queue.declare'{queue = AMQPQueue},
@@ -116,21 +126,43 @@ init_amqp_connection(AMQPHost, AMQPExchange, AMQPExchangeType, AMQPQueue) ->
       {error, Error}
     end.
 
+declare_exchange(AMQPChannel, ExchangeName, ExchangeType) ->
+  AMQPExchangeDeclaration = #'exchange.declare'{exchange = ensure_binary(ExchangeName), type=validate_exchange_type(ExchangeType)},
+  #'exchange.declare_ok'{} = amqp_channel:call(AMQPChannel, AMQPExchangeDeclaration),
+  ok.
+
+ensure_binary(Bin) when is_binary(Bin) ->
+  Bin;
+ensure_binary(List) when is_list(List) ->
+  list_to_binary(List);
+ensure_binary(Atom) when is_atom(Atom) ->
+  atom_to_binary(Atom, latin1).
+
+validate_exchange_type(AMQPExchangeType) ->
+  BinExchangeName = ensure_binary(AMQPExchangeType),
+  case BinExchangeName of 
+    <<"fanout">> ->
+      BinExchangeName;
+    _Type ->
+      throw(unsupported_amqp_exchange_type)
+  end.
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
 init([]) ->
     {ok, #state{}, infinity}.
-    %case init_amqp_connection() of 
-    %{ok, AMQP} ->
-    %  {ok, #state{amqp=AMQP}, infinity};
-    %{error, Error} ->
-    %  {stop, Error}
-    %end.
 
-handle_call({init_amqp_connection, Host, Exchange, ExchangeType, Queue, MessageProcessor}, _FROM, State) ->
-  case init_amqp_connection(Host, Exchange, ExchangeType, Queue) of 
+handle_call({init_amqp_connection, Host}, _FROM, State) ->
+  case init_amqp_connection(Host) of 
+    {ok, AMQP} ->
+      {reply, ok, State#state{amqp=AMQP}};
+    {error, Error} ->
+      {reply, {error, Error}, State}
+  end;
+handle_call({init_and_subscribe, Host, Exchange, ExchangeType, Queue, MessageProcessor}, _FROM, State) ->
+  case init_and_subscribe(Host, Exchange, ExchangeType, Queue) of 
     {ok, AMQP} ->
       {reply, ok, State#state{amqp=AMQP, message_processor=MessageProcessor}};
     {error, Error} ->
@@ -142,6 +174,18 @@ handle_call(get_messages_cnt, _From, #state{messages_since_last_metrics_call=Msg
 
 handle_call(get_server_state, _From, State) ->
   {reply, State, State};
+handle_call({declare_exchange, ExchangeName, ExchangeType}, _From, #state{amqp=AMQP} = State) ->
+  case AMQP#amqp.amqp_channel of 
+    undefined ->
+      {reply, {error, nochannelexists}, State};
+    AMQPChannel ->
+      declare_exchange(AMQPChannel, ExchangeName, ExchangeType),
+      {reply, ok, State}
+  end;
+handle_call({publish, ExchangeName, Payload}, _From, #state{amqp=AMQP} = State) ->
+  Publish = #'basic.publish'{exchange = ensure_binary(ExchangeName)},
+  amqp_channel:cast(AMQP#amqp.amqp_channel, Publish, #amqp_msg{payload = Payload}),
+  {reply, ok, State};
 handle_call(_Request, _From, State) ->
   {noreply, State}.
 
